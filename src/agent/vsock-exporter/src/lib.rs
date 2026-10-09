@@ -20,9 +20,11 @@ use opentelemetry::sdk::export::trace::{ExportResult, SpanData, SpanExporter};
 use opentelemetry::sdk::export::ExportError;
 use slog::{error, o, Logger};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tokio::time::{sleep_until, timeout, Instant};
 use tokio_vsock::VsockStream;
 
 const ANY_CID: &str = "any";
@@ -37,11 +39,20 @@ const DEFAULT_CID: u32 = libc::VMADDR_CID_HOST;
 // The VSOCK port the forwarders listens on by default
 const DEFAULT_PORT: u32 = 10240;
 
+// Bound the complete export, including connection setup, writes and backoff,
+// by the BatchSpanProcessor's default export timeout. Its shorter deadlines
+// may still cancel us. The processor owns the queue; we retain only its batch.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub struct Exporter {
     port: u32,
     cid: u32,
     conn: Option<Arc<Mutex<VsockStream>>>,
+    retry_delay: Duration,
+    retry_at: Option<Instant>,
     logger: Logger,
 }
 
@@ -49,6 +60,48 @@ impl Exporter {
     /// Create a new exporter builder.
     pub fn builder() -> Builder {
         Builder::default()
+    }
+
+    async fn export_with_retry(&mut self, batch: &[SpanData]) -> ExportResult {
+        // Keep ownership inside this future so any error or cancellation drops
+        // an incomplete stream. Only a fully written batch restores the cache.
+        let mut conn = self.conn.take();
+        loop {
+            if let Some(retry_at) = self.retry_at {
+                sleep_until(retry_at).await;
+            }
+
+            let maximum_ms = self.retry_delay.as_millis() as u64;
+            let delay = Duration::from_millis(rand::random_range(maximum_ms * 4 / 5..=maximum_ms));
+            self.retry_delay = (self.retry_delay * 2).min(MAX_RETRY_DELAY);
+            // Arm before awaiting so cancellation does not reset the backoff.
+            // Preserve this state across batches that exhaust their budget.
+            self.retry_at = Some(Instant::now() + delay);
+
+            let result = async {
+                if conn.is_none() {
+                    let stream = connect_vsock(self.cid, self.port).await?;
+                    conn = Some(Arc::new(Mutex::new(stream)));
+                }
+                handle_batch(conn.as_ref().unwrap().clone(), batch).await
+            }
+            .await;
+
+            match result {
+                Ok(()) => {
+                    self.conn = conn;
+                    self.retry_delay = INITIAL_RETRY_DELAY;
+                    self.retry_at = None;
+                    return Ok(());
+                }
+                Err(err @ Error::SerialisationError(_)) => return Err(err.into()),
+                Err(err) => {
+                    error!(self.logger, "trace export failed; retrying"; "error" => err.to_string(), "retry_ms" => delay.as_millis());
+                    conn = None;
+                    self.retry_at = Some(Instant::now() + delay);
+                }
+            }
+        }
     }
 }
 
@@ -68,19 +121,11 @@ impl ExportError for Error {
     }
 }
 
-fn make_io_error(desc: String) -> std::io::Error {
-    std::io::Error::other(desc)
-}
-
 // Send a trace span to the forwarder running on the host.
-async fn write_span(
-    writer: Arc<Mutex<VsockStream>>,
-    span: &SpanData,
-) -> Result<(), std::io::Error> {
+async fn write_span(writer: Arc<Mutex<VsockStream>>, span: &SpanData) -> Result<(), Error> {
     let mut writer = writer.lock().await;
 
-    let encoded_payload: Vec<u8> =
-        serde_json::to_vec(span).map_err(|e| make_io_error(e.to_string()))?;
+    let encoded_payload: Vec<u8> = serde_json::to_vec(span)?;
     let payload_len: u64 = encoded_payload.len() as u64;
 
     let mut payload_len_as_bytes: [u8; HEADER_SIZE_BYTES as usize] =
@@ -92,15 +137,13 @@ async fn write_span(
     // Send the header
     writer.write_all(&payload_len_as_bytes).await?;
 
-    writer.write_all(&encoded_payload).await
+    writer.write_all(&encoded_payload).await?;
+    Ok(())
 }
 
-async fn handle_batch(
-    writer: Arc<Mutex<VsockStream>>,
-    batch: Vec<SpanData>,
-) -> Result<(), std::io::Error> {
+async fn handle_batch(writer: Arc<Mutex<VsockStream>>, batch: &[SpanData]) -> Result<(), Error> {
     for span_data in batch {
-        write_span(writer.clone(), &span_data).await?;
+        write_span(writer.clone(), span_data).await?;
     }
 
     Ok(())
@@ -109,27 +152,17 @@ async fn handle_batch(
 #[async_trait]
 impl SpanExporter for Exporter {
     async fn export(&mut self, batch: Vec<SpanData>) -> ExportResult {
-        // Only cache streams after a complete batch. An error or cancellation
-        // must drop the stream: the next export cannot resume a partial frame.
-        let conn = match self.conn.take() {
-            Some(conn) => conn,
-            None => {
-                let conn = connect_vsock(self.cid, self.port).await.map(|e| {
-                    error!(self.logger, "failed to obtain connection"; "error" => format!("{:?}", e));
-                    e
-                })?;
-
-                Arc::new(Mutex::new(conn))
-            }
-        };
-
-        handle_batch(conn.clone(), batch).await.map_err(|e| {
-            error!(self.logger, "handle_batch error: {:?}", e);
-            Error::IOError(e)
-        })?;
-
-        self.conn = Some(conn);
-        Ok(())
+        // A retry can duplicate spans already written before a failure: the
+        // wire protocol has no acknowledgements. Never replay a partial frame
+        // on the same stream; retry the supplied batch on a new connection.
+        timeout(EXPORT_TIMEOUT, self.export_with_retry(&batch))
+            .await
+            .map_err(|_| {
+                Error::IOError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "VSOCK export exceeded its 30 second retry budget",
+                ))
+            })?
     }
 
     fn shutdown(&mut self) {
@@ -185,6 +218,8 @@ impl Builder {
             port,
             cid,
             conn: None,
+            retry_delay: INITIAL_RETRY_DELAY,
+            retry_at: None,
             logger: logger.new(o!("cid" => cid_str, "port" => port)),
         }
     }

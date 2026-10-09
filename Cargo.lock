@@ -8822,6 +8822,7 @@ dependencies = [
  "byteorder",
  "libc",
  "opentelemetry 0.17.0",
+ "rand 0.10.1",
  "serde_json",
  "slog",
  "thiserror 2.0.18",
